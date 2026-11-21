@@ -1,5 +1,27 @@
 """内置示例：温度扩范围、质控码缺省。供网页一键填入编辑器。"""
 
+# 库内试跑示例报文（逐行 JSON）：覆盖合法/缺省/显式 null/浮点写法/多余字段/
+# 布尔/非对象/大整数/另一 anyOf 分支等情形，用于演示 Python 与库内判定对照。
+SQL_TRIAL_SAMPLES = [
+    '{"temp": 21, "site": "WQ-01"}',
+    '{"temp": 21, "site": "WQ-01", "qc": "N"}',
+    '{"temp": 21, "site": "WQ-01", "qc": null}',
+    '{"temp": 21, "site": "WQ-01", "qc": "Z"}',
+    '{"temp": 21.0, "site": "WQ-01"}',
+    '{"temp": 2e1, "site": "WQ-01"}',
+    '{"temp": -0, "site": "WQ-02"}',
+    '{"temp": 21, "site": "WQ-01", "extra": 1}',
+    '{"temp": true, "site": "WQ-01"}',
+    '{"site": "WQ-01"}',
+    '{"temp": 99999999999999999999, "site": "WQ-01"}',
+    '{"level": 2, "site": "WQ-01"}',
+    '{"level": 2.0, "site": "WQ-01"}',
+    '[1, 2]',
+    'null',
+    '"just a string"',
+]
+
+
 TEMP_FW_V1 = {
     "type": "object",
     "properties": {

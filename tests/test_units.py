@@ -8,6 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from schema_spec import SchemaError, message_valid, parse_schema  # noqa: E402
 from solver import check_compatibility, find_counterexample  # noqa: E402
+from sqlgen import INT_TEXT_RE, schema_sql  # noqa: E402
+from sqltrial import _strict_loads  # noqa: E402
 
 PASS = []
 
@@ -163,5 +165,56 @@ ok("z3:枚举越界反例", cex is not None and cex.get("lv") == 3)
 problems = check_compatibility([(1, fw(-40, 100))], [("p1", fw(-10, 50)), ("p2", fw(-40, 100))])
 ok("z3:交叉检查定位拒收程序", len(problems) == 1 and problems[0]["program_id"] == "p1"
    and problems[0]["firmware_version"] == 1)
+
+# ---------- SQL 表达式生成（结构检查；库内一致性见 test_sql_diff.py） ----------
+def sql_of(doc):
+    return schema_sql(parse_schema(doc))
+
+
+e = sql_of({"type": "object",
+            "properties": {"t": {"type": "integer", "minimum": -5, "maximum": 9},
+                           "s": {"enum": ["a'b", None]},
+                           "u": {"type": "integer"}},
+            "required": ["t"], "additionalProperties": False})
+ok("sql:COALESCE兜底", e.startswith("COALESCE(") and e.endswith(", false)"))
+ok("sql:对象类型检查", "json_typeof(payload) = 'object'" in e)
+ok("sql:键集合包含检查", "json_object_keys(payload)" in e
+   and "ARRAY['s', 't', 'u']::text[]" in e)
+ok("sql:required存在性", "(payload -> 't') IS NOT NULL" in e)
+ok("sql:可选字段缺省放行", "(payload -> 's') IS NULL OR" in e)
+ok("sql:整数写法正则", f"~ '{INT_TEXT_RE}'" in e)
+ok("sql:范围比较", "::numeric >= -5" in e and "::numeric <= 9" in e)
+ok("sql:无界整数无比较", "(payload ->> 'u'))::numeric >=" not in e)
+ok("sql:显式null选项", "json_typeof((payload -> 's')) = 'null'" in e)
+ok("sql:字符串单引号转义", "'a''b'" in e)
+ok("sql:字符串枚举IN", "(payload ->> 's') IN ('a''b')" in e)
+
+e = sql_of({"anyOf": [
+    {"type": "object", "properties": {"a": {"type": "integer", "enum": [3, 1]}},
+     "required": ["a"], "additionalProperties": False},
+    {"type": "object", "properties": {}, "additionalProperties": False}]})
+ok("sql:anyOf分支OR", "\n   OR (" in e)
+ok("sql:整数枚举排序", "::numeric IN (1, 3)" in e)
+ok("sql:空properties空数组", "ARRAY[]::text[]" in e)
+
+e = sql_of({"type": "object", "properties": {"q": {"type": "null"}},
+            "additionalProperties": False})
+ok("sql:纯null类型", "json_typeof((payload -> 'q')) = 'null'" in e)
+
+# 特殊字符字段名转义
+e = sql_of({"type": "object", "properties": {"we'ird": {"type": "integer"}},
+            "required": ["we'ird"], "additionalProperties": False})
+ok("sql:字段名单引号转义", "payload -> 'we''ird'" in e
+   and "ARRAY['we''ird']::text[]" in e)
+
+# ---------- 严格 JSON 解析（与 PostgreSQL json 对齐） ----------
+ok("strict:普通报文", _strict_loads('{"a": 1}') == {"a": 1})
+ok("strict:标量", _strict_loads("5") == 5)
+for bad in ["NaN", "Infinity", "-Infinity", '{"a": NaN}']:
+    try:
+        _strict_loads(bad)
+        ok(f"strict:拒绝{bad}", False)
+    except ValueError:
+        ok(f"strict:拒绝{bad}", True)
 
 print(f"全部 {len(PASS)} 项单元自测通过")

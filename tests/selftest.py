@@ -177,6 +177,108 @@ def main():
             assert c.post(f"/api/models/{m2}/programs",
                           json={"program_id": "P", "schema": temp_doc(0, 100)}).status_code == 200
 
+    # ---- 库内筛查表达式：选契约 → 生成 → 库内试跑 → 逐条对照 ----
+    print("库内筛查表达式（PostgreSQL 16）")
+    m3 = f"s{uuid.uuid4().hex[:10]}"
+    assert c.post("/api/models", json={"name": m3}).status_code == 201
+    anyof_doc = {"anyOf": [
+        {"type": "object",
+         "properties": {"temp": {"type": "integer", "minimum": -40, "maximum": 100},
+                        "site": {"type": "string", "enum": ["WQ-01", "WQ-02"]},
+                        "qc": {"enum": ["N", "Q", None]}},
+         "required": ["temp", "site"], "additionalProperties": False},
+        {"type": "object",
+         "properties": {"level": {"type": "integer", "enum": [0, 1, 2, 3]},
+                        "site": {"type": "string", "enum": ["WQ-01", "WQ-02"]}},
+         "required": ["level", "site"], "additionalProperties": False}]}
+    assert c.post(f"/api/models/{m3}/programs",
+                  json={"program_id": "analyzer", "schema": anyof_doc}).status_code == 200
+    assert c.post(f"/api/models/{m3}/firmware",
+                  json={"schema": anyof_doc["anyOf"][0]}).status_code == 200
+    assert c.post(f"/api/models/{m3}/firmware",
+                  json={"schema": anyof_doc}).status_code == 200
+
+    def sqlcheck(ver, lines):
+        return c.post(f"/api/models/{m3}/firmware/{ver}/sqlcheck",
+                      json={"lines": lines})
+
+    r = sqlcheck(2, ["{}"])
+    if r.status_code == 422 and "PostgreSQL" in r.json().get("error", ""):
+        print("  - 当前服务未接 PostgreSQL，跳过库内试跑对照（Compose 部署下自动启用）")
+    else:
+        lines = [
+            '{"temp": 21, "site": "WQ-01"}',              # 合法：分支一
+            '{"temp": 21, "site": "WQ-01", "qc": null}',  # 合法：显式 null
+            '{"temp": 21, "site": "WQ-01", "qc": "Q"}',   # 合法
+            '{"level": 2, "site": "WQ-02"}',              # 合法：anyOf 分支二
+            '{"temp": -0, "site": "WQ-01"}',              # 合法：-0 是整数
+            '{"temp": 21.0, "site": "WQ-01"}',            # 假：浮点写法
+            '{"temp": 2e1, "site": "WQ-01"}',             # 假：指数写法
+            '{"level": 2.0, "site": "WQ-01"}',            # 假：浮点写法
+            '{"temp": 21, "site": "WQ-01", "x": 1}',      # 假：多余字段
+            '{"temp": 21}',                               # 假：缺 required
+            '{"temp": null, "site": "WQ-01"}',            # 假：显式 null ≠ 缺省
+            '{"temp": true, "site": "WQ-01"}',            # 假：布尔非整数
+            '{"temp": 99999999999999999999, "site": "WQ-01"}',  # 假：大整数越界
+            '{"temp": 1e999999, "site": "WQ-01"}',        # 假：大指数写法
+            '{"level": 4, "site": "WQ-01"}',              # 假：枚举外
+            '{"temp": 21, "site": "WQ-03"}',              # 假：站点枚举外
+            '[1, 2]', 'null', '"s"', '5',                 # 假：非对象
+            '{"temp": 21, "site": "WQ-01", "qc": 1}',     # 假：qc 类型不符
+            '{这行不是 JSON}',                             # 跳过：非法 JSON
+        ]
+        r = sqlcheck(2, lines)
+        body = r.json()
+        ok("anyOf契约试跑一致并交付表达式", r.status_code == 200 and body["ok"]
+           and "expression" in body, r.text[:300])
+        ok("表达式COALESCE兜底", body.get("expression", "").startswith("COALESCE("))
+        ok("对照行数", body["compared"] == len(lines) - 1, json.dumps(body)[:300])
+        ok("非法JSON行被跳过", body["skipped"] == 1
+           and any(x["status"] == "skipped" for x in body["results"]))
+        ok("逐条结果均一致", all(x["status"] == "agree" for x in body["results"]
+                                 if x["status"] != "skipped"),
+           json.dumps([x for x in body["results"] if x["status"] not in ("agree", "skipped")]))
+        by_text = {x["text"]: x for x in body["results"]}
+        ok("浮点写法判假", by_text['{"temp": 21.0, "site": "WQ-01"}']['python'] is False
+           and by_text['{"temp": 21.0, "site": "WQ-01"}']['sql'] is False)
+        ok("显式null判真", by_text['{"temp": 21, "site": "WQ-01", "qc": null}']['sql'] is True)
+        ok("缺省字段判假", by_text['{"temp": 21}']['sql'] is False)
+        ok("anyOf分支二判真", by_text['{"level": 2, "site": "WQ-02"}']['sql'] is True)
+
+        # 单分支契约（v1）同样可交付
+        r = sqlcheck(1, ['{"temp": 0, "site": "WQ-01"}',
+                         '{"level": 0, "site": "WQ-01"}'])
+        ok("单分支契约试跑一致", r.status_code == 200 and r.json()["ok"]
+           and r.json()["results"][1]["sql"] is False, r.text[:300])
+
+        # 出错路径：含未成对代理项的报文 → 说明原因、暂不提供表达式
+        r = sqlcheck(2, ['{"temp": 21, "site": "WQ-01"}',
+                         '{"temp": 21, "site": "WQ-01", "qc": "\\ud800"}'])
+        body = r.json()
+        ok("代理项报错且暂不提供表达式", r.status_code == 422 and not body["ok"]
+           and "expression" not in body and body["error"], r.text[:300])
+        ok("报错定位到行", any(x["status"] == "sql-error" for x in body["results"]),
+           r.text[:300])
+
+        # 空报文 / 不存在的版本
+        r = sqlcheck(2, [])
+        ok("空报文不交付表达式", r.status_code == 422 and not r.json()["ok"]
+           and "expression" not in r.json(), r.text[:300])
+        r = sqlcheck(99, ["{}"])
+        ok("版本不存在404", r.status_code == 404, r.text[:300])
+
+        # 网页表单：选契约 + 粘贴报文 → 试跑 → 交付表达式
+        r = c.post(f"/models/{m3}/sqlcheck",
+                   data={"version": "2",
+                          "payload_lines": "\n".join(lines[:5])})
+        ok("网页试跑交付表达式", r.status_code == 200 and "表达式可交付" in r.text
+           and "COALESCE(" in r.text and "逐条对照" in r.text, str(r.status_code))
+        r = c.post(f"/models/{m3}/sqlcheck",
+                   data={"version": "2",
+                          "payload_lines": '{"temp": 21, "site": "WQ-01", "qc": "\\ud800"}'})
+        ok("网页出错暂不提供表达式", r.status_code == 200
+           and "暂不提供表达式" in r.text, str(r.status_code))
+
     # ---- HTML 页面冒烟 ----
     print("HTML 页面")
     r = c.get("/")
@@ -185,6 +287,7 @@ def main():
     ok("型号页可打开", r.status_code == 200 and "历代固件写入格式" in r.text
        and "现用程序读取格式" in r.text and "发布日志" in r.text)
     ok("页面含示例", "温度扩范围" in r.text and "质控码缺省" in r.text)
+    ok("页面含库内筛查区", "库内筛查表达式" in r.text and "payload" in r.text)
     r = c.post(f"/models/{model}/firmware",
                data={"schema_text": json.dumps(temp_doc(-40, 100))})
     ok("网页表单发布固件被拒并展示依据", r.status_code == 200

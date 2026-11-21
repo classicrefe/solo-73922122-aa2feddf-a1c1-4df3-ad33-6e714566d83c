@@ -66,6 +66,74 @@
   </div>
 </div>
 
+<h2>库内筛查表达式（PostgreSQL 16 · 暂存表报文列 payload json）</h2>
+<div class="card">
+  {% if firmwares %}
+  <p class="muted">选择一版已发布的固件写入格式，粘贴逐行报文（每行一条 JSON）后试跑：
+  系统生成拟交付的 WHERE 布尔表达式，在数据库内执行并与 Python 判定逐条对照。
+  <b>全部一致才交付表达式；试跑出错或有分歧时说明原因、暂不提供。</b>
+  表达式区分字段缺省与显式 null，也区分整数写法与 1.0、1e0 等写法；每行只返回真或假（SQL NULL 判假）。</p>
+  <form method="post" action="/models/{{ model.name }}/sqlcheck">
+    <p>固件格式版本：
+      <select name="version" id="sql_version">
+        {% for f in firmwares %}
+        <option value="{{ f.version }}"
+                {% if sql_trial and sql_trial.version == f.version %}selected{% endif %}>v{{ f.version }}</option>
+        {% endfor %}
+      </select>
+      <button type="button" class="btn-sm" onclick="fillSampleLines(this)"
+              data-samples='{{ sql_trial_samples | tojsonc }}'>填入示例报文</button>
+    </p>
+    <textarea id="payload_lines" name="payload_lines"
+              placeholder='{"temp": 21, "site": "WQ-01"}&#10;{"temp": 21.0, "site": "WQ-01"}&#10;{"level": 2, "site": "WQ-01"}'>{{ sql_trial.lines_text if sql_trial else "" }}</textarea>
+    <button type="submit">生成并库内试跑</button>
+  </form>
+  {% else %}
+  <p class="muted">尚未发布固件写入格式，请先在上方发布；发布后即可生成库内筛查表达式并试跑。</p>
+  {% endif %}
+</div>
+
+{% if sql_trial %}
+  {% if sql_trial.ok %}
+  <div class="card notice-ok">
+    <h3>✔ 试跑一致，表达式可交付</h3>
+    <p>固件写入格式 <b>v{{ sql_trial.version }}</b>：共对照 {{ sql_trial.compared }} 条报文
+       {% if sql_trial.skipped %}（另有 {{ sql_trial.skipped }} 行非法/非标准 JSON 未纳入对照）{% endif %}，
+       Python 与库内判定全部一致。表达式可直接放入 WHERE 子句（每行只返回真或假）：</p>
+    <pre>{{ sql_trial.expression }}</pre>
+    <p class="muted">用法：筛出<b>不符合</b>契约的行 ——
+      <code>SELECT * FROM 暂存表 WHERE NOT (</code>上述表达式<code>);</code>
+      符合契约的行则直接以其为 WHERE 条件。</p>
+  </div>
+  {% else %}
+  <div class="card notice-bad">
+    <h3>✘ 试跑未通过，暂不提供表达式</h3>
+    <p>{{ sql_trial.error }}</p>
+  </div>
+  {% endif %}
+  {% if sql_trial.rows %}
+  <div class="card">
+    <h3 style="margin-top:0">逐条对照（{{ sql_trial.rows | length }} 行）</h3>
+    <table>
+      <tr><th>#</th><th>报文</th><th>Python 判定</th><th>库内 SQL 判定</th><th>结论</th></tr>
+      {% for r in sql_trial.rows %}
+      <tr>
+        <td class="muted">{{ r.line_no }}</td>
+        <td><pre>{{ r.text }}</pre></td>
+        <td>{{ r.python_disp }}</td>
+        <td>{{ r.sql_disp }}</td>
+        <td>{% if r.status == "agree" %}<span style="color:var(--ok)">一致</span>
+            {% elif r.status == "diverge" %}<span class="err">分歧</span>
+            {% elif r.status == "sql-error" %}<span class="err">执行出错</span>
+            {% else %}<span class="muted">跳过</span>{% endif %}
+            {% if r.note %}<br><span class="muted">{{ r.note }}</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+{% endif %}
+
 <h2>示例（点击填入编辑器）</h2>
 {% for ex in examples %}
 <div class="card">
@@ -98,6 +166,11 @@
 </table>
 
 <script>
+function fillSampleLines(btn) {
+  const samples = JSON.parse(btn.dataset.samples);
+  document.getElementById('payload_lines').value = samples.join('\n');
+  document.getElementById('payload_lines').scrollIntoView({behavior: 'smooth'});
+}
 function fillSnippet(btn) {
   const target = btn.dataset.target;
   const doc = JSON.parse(btn.dataset.doc);

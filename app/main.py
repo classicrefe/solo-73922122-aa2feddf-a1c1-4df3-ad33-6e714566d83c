@@ -12,9 +12,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 import service
+import sqltrial
 from db import (Base, DeviceModel, FirmwareFormat, ProgramFormat, PublishLog,
                 SessionLocal, engine)
-from examples import EXAMPLES
+from examples import EXAMPLES, SQL_TRIAL_SAMPLES
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -55,7 +56,7 @@ def _get_model_or_404(name: str) -> DeviceModel:
         return DeviceModel(id=m.id, name=m.name)
 
 
-def _model_context(name: str, result=None):
+def _model_context(name: str, result=None, sql_trial=None):
     with SessionLocal() as s:
         model = s.execute(select(DeviceModel).where(DeviceModel.name == name)).scalar_one_or_none()
         if model is None:
@@ -73,6 +74,7 @@ def _model_context(name: str, result=None):
             "model": model, "firmwares": firmwares, "programs": programs,
             "logs": logs, "examples": EXAMPLES, "result": result,
             "max_formats": service.MAX_FORMATS,
+            "sql_trial": sql_trial, "sql_trial_samples": SQL_TRIAL_SAMPLES,
         }
 
 
@@ -139,6 +141,17 @@ def prog_publish_html(request: Request, name: str,
         outcome = service.publish_program(model.id, program_id.strip(), doc)
     return templates.TemplateResponse(request, "model.html",
                                       _model_context(name, result=outcome))
+
+
+@app.post("/models/{name}/sqlcheck", response_class=HTMLResponse)
+def sqlcheck_html(request: Request, name: str,
+                  version: int = Form(...), payload_lines: str = Form("")):
+    model = _get_model_or_404(name)
+    lines = payload_lines.splitlines()
+    trial = sqltrial.trial_firmware_sql(model.id, version, lines,
+                                        lines_text=payload_lines)
+    return templates.TemplateResponse(request, "model.html",
+                                      _model_context(name, sql_trial=trial))
 
 
 # ---------------- JSON API ----------------
@@ -222,3 +235,32 @@ def api_publish_program(name: str, body: ProgramIn):
     model = _get_model_or_404(name)
     outcome = service.publish_program(model.id, body.program_id.strip(), body.doc)
     return _outcome_response(outcome)
+
+
+class SqlTrialIn(BaseModel):
+    lines: list[str] = Field(default_factory=list, max_length=sqltrial.MAX_LINES)
+
+
+@app.post("/api/models/{name}/firmware/{version}/sqlcheck")
+def api_sqlcheck(name: str, version: int, body: SqlTrialIn):
+    """生成拟交付的 PostgreSQL 16 WHERE 表达式并库内试跑、与 Python 逐条对照。
+
+    全部一致时返回 expression（可交付）；出错或有分歧时不返回 expression。
+    """
+    model = _get_model_or_404(name)
+    trial = sqltrial.trial_firmware_sql(model.id, version, body.lines)
+    resp = {
+        "ok": trial.ok,
+        "version": trial.version,
+        "compared": trial.compared,
+        "skipped": trial.skipped,
+        "results": [{"line_no": r.line_no, "text": r.text, "status": r.status,
+                     "python": r.python, "sql": r.sql, "note": r.note}
+                    for r in trial.rows],
+    }
+    if trial.ok:
+        resp["expression"] = trial.expression
+    if trial.error:
+        resp["error"] = trial.error
+    status = 200 if trial.ok else (404 if trial.error and "不存在" in trial.error else 422)
+    return JSONResponse(resp, status_code=status)
